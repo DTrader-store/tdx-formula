@@ -248,6 +248,7 @@ impl<'data> Evaluator<'data> {
                     "BETWEEN" => self.builtin_between(&arg_series), // Between bounds
                     "EMA" => self.builtin_ema(&arg_series), // Exponential Moving Average (SMA with M=2)
 
+                    "IF" => self.builtin_if(&arg_series),
                     // TODO: 添加其他内置函数
                     other_name => Err(format!(
                         "Runtime Error: Unrecognized function '{}'",
@@ -766,6 +767,41 @@ impl<'data> Evaluator<'data> {
         Ok(result)
     }
 
+    // 条件判断: IF(Condition, Value1, Value2)
+    // 如果 Condition 为真(非零且非 NaN)，返回 Value1，否则返回 Value2
+    fn builtin_if(&self, args: &[Vec<f64>]) -> Result<Vec<f64>, String> {
+        if args.len() != 3 {
+            return Err(
+                "Runtime Error: IF function requires 3 arguments (Condition, Value1, Value2)."
+                    .to_string(),
+            );
+        }
+
+        let condition_series = &args[0];
+        let value1_series = &args[1];
+        let value2_series = &args[2];
+
+        let len = self.input_data.num_bars;
+        let mut result = Vec::with_capacity(len);
+
+        for i in 0..len {
+            let condition_val = *condition_series.get(i).unwrap_or(&f64::NAN); // 序列短了则视为 NaN
+            let value1_val = *value1_series.get(i).unwrap_or(&f64::NAN); // 序列短了则视为 NaN
+            let value2_val = *value2_series.get(i).unwrap_or(&f64::NAN); // 序列短了则视为 NaN
+
+            // 判断条件：非零且非 NaN 为真
+            let is_true = condition_val != 0.0 && !condition_val.is_nan();
+
+            if is_true {
+                result.push(value1_val);
+            } else {
+                result.push(value2_val);
+            }
+        }
+
+        Ok(result)
+    }
+
     // TODO: 添加更多内置函数，如 FILTER 等等...
     // 这部分工作量很大，需要逐个实现。
 }
@@ -879,6 +915,38 @@ mod tests {
             ); // 使用一个小的 epsilon
         }
         // 不需要最后的 assert_eq!(actual_result, expected_result, ...); 了，上面的循环已经完全比较了所有内容
+    }
+
+    // Helper function to parse, evaluate, and assert an error
+    pub fn check_evaluation_error(
+        input: &str,
+        input_data: &InputData,
+        expected_error_substring: &str,
+    ) {
+        let lexer = crate::lexer::Lexer::new(input);
+        let mut parser = Parser::new(lexer);
+        let formula = parser.parse_formula().expect("Parsing failed");
+
+        let mut evaluator = Evaluator::new(input_data);
+        let actual_result = evaluator.evaluate_formula(&formula);
+
+        match actual_result {
+            Ok(result) => {
+                panic!(
+                    "Evaluation unexpectedly succeeded for input \"{}\". Got: {:?}",
+                    input, result
+                );
+            }
+            Err(e) => {
+                assert!(
+                    e.contains(expected_error_substring),
+                    "Input: \"{}\"\nExpected error containing: \"{}\"\nActual error: \"{}\"",
+                    input,
+                    expected_error_substring,
+                    e
+                );
+            }
+        }
     }
 
     // 测试简单的常量和变量引用
@@ -1395,6 +1463,121 @@ mod tests {
         check_evaluation(formula_input, &input_data, expected_result);
 
         // TODO: 添加 EMA(C, 0) 或周期 > len 的情况
+    }
+
+    // --- Test IF Function ---
+    #[test]
+    fn test_eval_if_function() {
+        let num_bars = 5;
+        let mut input_data = create_dummy_input_data(num_bars);
+        // C: [10.5, 11.5, 12.5, 13.5, 14.5]
+        // O: [10.0, 11.0, 12.0, 13.0, 14.0]
+        // H: [11.0, 12.0, 13.0, 14.0, 15.0]
+        // L: [9.0, 10.0, 11.0, 12.0, 13.0]
+
+        // Condition C > O: [T, T, T, T, T] => [1.0, 1.0, 1.0, 1.0, 1.0]
+        // Test: RESULT: IF(C > O, H, L);
+        let formula_input_simple = "RESULT: IF(C > O, H, L);";
+        // Condition is always true, so RESULT should be H
+        let expected_simple_data = input_data.highs.clone();
+        let expected_result_simple = FormulaResult::new(vec![OutputLineResult {
+            name: "RESULT".to_string(),
+            data: expected_simple_data,
+            styles: vec![],
+        }]);
+        check_evaluation(formula_input_simple, &input_data, expected_result_simple);
+
+        // Modify data to make condition C > O alternate
+        // C: [10.0, 11.5, 12.0, 13.5, 14.0]
+        // O: [10.0, 11.0, 12.0, 13.0, 14.0]
+        input_data.closes = vec![10.0, 11.5, 12.0, 13.5, 14.0];
+        // Condition C > O: [F, T, F, T, F] => [0.0, 1.0, 0.0, 1.0, 0.0]
+
+        // Test: RESULT_ALT: IF(C > O, H, L);
+        // H: [11.0, 12.0, 13.0, 14.0, 15.0]
+        // L: [9.0, 10.0, 11.0, 12.0, 13.0]
+        // Expected: [L[0], H[1], L[2], H[3], L[4]]
+        // Expected: [9.0, 12.0, 11.0, 14.0, 13.0]
+        let formula_input_alt = "RESULT_ALT: IF(C > O, H, L);";
+        let expected_alt_data = vec![
+            input_data.lows[0],
+            input_data.highs[1],
+            input_data.lows[2],
+            input_data.highs[3],
+            input_data.lows[4],
+        ];
+        let expected_result_alt = FormulaResult::new(vec![OutputLineResult {
+            name: "RESULT_ALT".to_string(),
+            data: expected_alt_data,
+            styles: vec![],
+        }]);
+        check_evaluation(formula_input_alt, &input_data, expected_result_alt);
+
+        // Test with literal values
+        // C > O: [0.0, 1.0, 0.0, 1.0, 0.0]
+        // Test: RESULT_LIT: IF(C > O, 100, -100);
+        // Expected: [-100.0, 100.0, -100.0, 100.0, -100.0]
+        let formula_input_lit = "RESULT_LIT: IF(C > O, 100, -100);";
+        let expected_lit_data = vec![-100.0, 100.0, -100.0, 100.0, -100.0];
+        let expected_result_lit = FormulaResult::new(vec![OutputLineResult {
+            name: "RESULT_LIT".to_string(),
+            data: expected_lit_data,
+            styles: vec![],
+        }]);
+        check_evaluation(formula_input_lit, &input_data, expected_result_lit);
+
+        // Test with NaN in inputs
+        let mut input_data_nan = create_dummy_input_data(num_bars);
+        // C: [10.5, 11.5, NaN, 13.5, 14.5]
+        // O: [10.0, NaN, 12.0, 13.0, NaN]
+        // H: [11.0, 12.0, 13.0, NaN, 15.0]
+        // L: [NaN, 10.0, 11.0, 12.0, 13.0]
+        input_data_nan.closes[2] = f64::NAN;
+        input_data_nan.opens[1] = f64::NAN;
+        input_data_nan.opens[4] = f64::NAN;
+        input_data_nan.highs[3] = f64::NAN;
+        input_data_nan.lows[0] = f64::NAN;
+
+        // Condition C > O:
+        // i=0: 10.5 > 10.0 -> T (1.0)
+        // i=1: 11.5 > NaN -> F (0.0) - Assuming NaN condition is false
+        // i=2: NaN > 12.0 -> F (0.0) - Assuming NaN condition is false
+        // i=3: 13.5 > 13.0 -> T (1.0)
+        // i=4: 14.5 > NaN -> F (0.0) - Assuming NaN condition is false
+        // Condition series: [1.0, 0.0, 0.0, 1.0, 0.0]
+
+        // Test: RESULT_NAN: IF(C > O, H, L);
+        // H: [11.0, 12.0, 13.0, NaN, 15.0]
+        // L: [NaN, 10.0, 11.0, 12.0, 13.0]
+        // Expected: [H[0], L[1], L[2], H[3], L[4]]
+        // Expected: [11.0, 10.0, 11.0, NaN, 13.0]
+        let formula_input_nan = "RESULT_NAN: IF(C > O, H, L);";
+        let expected_nan_data = vec![
+            input_data_nan.highs[0],
+            input_data_nan.lows[1],
+            input_data_nan.lows[2],
+            input_data_nan.highs[3],
+            input_data_nan.lows[4],
+        ];
+        let expected_result_nan = FormulaResult::new(vec![OutputLineResult {
+            name: "RESULT_NAN".to_string(),
+            data: expected_nan_data,
+            styles: vec![],
+        }]);
+        check_evaluation(formula_input_nan, &input_data_nan, expected_result_nan);
+
+        // Test wrong argument count
+        let input_data_any = create_dummy_input_data(5);
+        check_evaluation_error(
+            "IF(C > O, H);",
+            &input_data_any,
+            "IF function requires 3 arguments",
+        );
+        check_evaluation_error(
+            "IF(C > O, H, L, V);",
+            &input_data_any,
+            "IF function requires 3 arguments",
+        );
     }
 
     // TODO: 添加 REF, CROSS 的更多边界测试

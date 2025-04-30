@@ -190,7 +190,10 @@ impl<'input> Parser<'input> {
                  Some(&TokenType::Identifier) |
                  Some(&TokenType::LParen) |
                  Some(&TokenType::Minus) | // Unary minus
-                 Some(&TokenType::Not) => { // Unary not
+                 Some(&TokenType::Not) |
+                 Some(&TokenType::If) |
+                 Some(&TokenType::And)|
+                 Some(&TokenType::Or)=> { // Unary not
                       self.parse_unnamed_output_statement()
                  }
                  _ => {
@@ -332,71 +335,64 @@ impl<'input> Parser<'input> {
     // - Grouped Expressions (`(` expression `)`)
     // - Unary Prefix Operators (`-` negation, `NOT`)
     fn parse_prefix(&mut self) -> Result<Expr, String> {
-        // Get the current token, or return an error if EOF/None.
+        // 获取当前 token，如果到文件末尾则报错
         let token = self.current_token.clone().ok_or_else(|| {
-            let location = "end of input".to_string(); // Or get last known location
+            let location = self
+                .current_token
+                .as_ref()
+                .map_or("end of input".to_string(), |t| {
+                    format!("line {}, column {}", t.line, t.column)
+                });
             format!(
                 "Syntax Error: Unexpected end of input while parsing expression at {}",
                 location
             )
         })?;
 
+        let location = format!("line {}, column {}", token.line, token.column); // 提前捕获位置信息
+
         match token.token_type {
-            // --- Literals ---
+            // --- 字面量 (数字) ---
             TokenType::Number => {
-                self.advance(); // Consume the number token
+                self.advance(); // 消耗数字 token
                 match token.lexeme.parse::<f64>() {
                     Ok(value) => Ok(Expr::Literal(LiteralValue::Number(value))),
                     Err(e) => Err(format!(
-                        "Syntax Error: Invalid number format '{}' at line {}, column {}: {}",
-                        token.lexeme, token.line, token.column, e
+                        "Syntax Error: Invalid number format '{}' at {}: {}",
+                        token.lexeme, location, e
                     )),
                 }
             }
 
-            // --- Variables or Function Calls ---
-            TokenType::Identifier => {
-                // Need to look ahead to see if it's followed by '(' for a function call.
-                if self.check_peek(TokenType::LParen) {
-                    // It's a function call
-                    self.parse_function_call()
-                } else {
-                    // Assume it's a variable reference
-                    self.advance(); // Consume the identifier token
-                    Ok(Expr::Variable(token.lexeme))
-                }
-            }
-
-            // --- Grouped Expression ---
+            // --- 分组表达式 (...) ---
             TokenType::LParen => {
-                self.advance(); // Consume '('
-                // Parse the expression inside the parentheses, starting with lowest precedence.
-                let inner_expr = self.parse_expression(0)?;
-                // Expect and consume the closing ')'.
-                self.expect(TokenType::RParen)?;
-                // Return the inner expression, possibly wrapped in Grouped if needed later.
-                // Often, just returning the inner_expr is enough as precedence is handled.
+                self.advance(); // 消耗 '('
+                let inner_expr = self.parse_expression(0)?; // 递归解析括号内的表达式
+                // 期望并消耗匹配的 ')'。提供更清晰的错误信息。
+                self.expect(TokenType::RParen)
+                    .map_err(|e| format!("Syntax Error: Mismatched parentheses: {}", e))?;
+                // 将内部表达式包装在 Grouped 节点中。
                 Ok(Expr::Grouped(Box::new(inner_expr)))
             }
 
-            // --- Unary Prefix Operators ---
+            // --- 一元前缀运算符 (- 和 NOT) ---
+            // 注意：TokenType::Not 也是关键字，如果后面没有需要它操作的表达式，会在后面的分支处理。
             TokenType::Minus | TokenType::Not => {
-                self.advance(); // Consume the operator token ('-' or 'NOT')
-                // Convert token type to UnaryOperator enum.
+                self.advance(); // 消耗运算符 token ('-' 或 'NOT')
+                // 转换为 AST 中的 UnaryOperator 枚举
                 let operator = self.token_to_unary_operator(&token.token_type)?;
 
-                // Get the binding power (precedence) for this unary operator.
-                // Unary operators usually bind tightly.
-                let (_left_bp, right_bp) =
+                // 获取该一元运算符的绑定强度（优先级）。
+                // 一元运算符通常与其操作数紧密绑定。
+                let (_lbp, right_bp) =
                     prefix_binding_power(&token.token_type).ok_or_else(|| {
                         format!(
-                            "Internal Error: No binding power defined for prefix operator {:?}",
-                            token.token_type
+                            "Internal Error: Missing prefix binding power for {:?} at {}",
+                            token.token_type, location
                         )
                     })?;
 
-                // Recursively parse the operand expression, using the operator's right binding power
-                // as the minimum precedence for the recursive call.
+                // 递归解析操作数表达式，使用运算符的右绑定强度作为递归调用的最低优先级。
                 let operand = self.parse_expression(right_bp)?;
 
                 Ok(Expr::UnaryOp {
@@ -405,74 +401,82 @@ impl<'input> Parser<'input> {
                 })
             }
 
-            // --- Unexpected Token ---
-            _ => {
-                let location = format!("line {}, column {}", token.line, token.column);
-                Err(format!(
-                    "Syntax Error: Unexpected token {:?} ({}) found when expecting start of an expression at {}",
-                    token.token_type, token.lexeme, location
-                ))
-            }
-        }
-    }
+            // --- 标识符 或 可能作为函数名使用的关键字 (如 IF, AND, OR, NOT) ---
+            // 这包括普通标识符 (如 MA, SUM, MYVAR, C, H) 和
+            // 也兼作函数名的关键字 (如 IF, AND, OR, NOT，当后面跟着括号时)。
+            TokenType::Identifier
+            | TokenType::If
+            | TokenType::And
+            | TokenType::Or
+            | TokenType::Not => {
+                let name_lexeme = token.lexeme.clone(); // 捕获词素 (如 "MA", "IF", "AND")
 
-    // Parses a function call: IDENTIFIER `(` [arg1 [, arg2...]] `)`
-    fn parse_function_call(&mut self) -> Result<Expr, String> {
-        // Assumes the current token is the Identifier (function name)
-        let func_name = self.expect_identifier()?; // Consume name
+                // 检查当前 token 后面是否跟着 '('
+                if self.check_peek(TokenType::LParen) {
+                    // 是函数调用。首先消耗函数名 token。
+                    self.advance(); // 消耗标识符或关键字 token (如 'MA', 'IF')
+                    self.expect(TokenType::LParen)?; // 消耗 '('
 
-        self.expect(TokenType::LParen)?; // Consume '('
+                    let mut args = Vec::new();
+                    // 解析参数直到遇到 ')'
+                    if !self.check(TokenType::RParen) {
+                        loop {
+                            // 解析一个参数表达式 (递归调用，从最低优先级开始)
+                            let arg_expr = self.parse_expression(0)?;
+                            args.push(arg_expr);
 
-        let mut args = Vec::new();
-        // Check if there are arguments (i.e., if the next token is not ')')
-        if !self.check(TokenType::RParen) {
-            // Parse arguments separated by commas
-            loop {
-                // Parse one argument expression
-                let arg_expr = self.parse_expression(0)?; // Arguments are full expressions
-                args.push(arg_expr);
-
-                // After an argument, expect either a comma or a closing parenthesis
-                if self.check(TokenType::Comma) {
-                    self.advance(); // Consume comma, continue loop for next argument
-                    // Handle trailing comma before ')' if allowed? TDX might not allow it.
-                    if self.check(TokenType::RParen) {
-                        let location = self
-                            .current_token
-                            .as_ref()
-                            .map_or("end of input".to_string(), |t| {
-                                format!("line {}, column {}", t.line, t.column)
-                            });
-                        return Err(format!(
-                            "Syntax Error: Unexpected ')' after comma in function call arguments at {}",
-                            location
-                        ));
+                            // 在一个参数后，期望是 ',' 表示还有下一个参数，或者是 ')' 表示参数结束
+                            if self.check(TokenType::Comma) {
+                                self.advance(); // 消耗 ','
+                                // 防止末尾逗号：检查 ',' 后面是否紧跟着 ')'
+                                if self.check(TokenType::RParen) {
+                                    let trailing_comma_loc = self
+                                        .current_token
+                                        .as_ref()
+                                        .map_or("end of input".to_string(), |t| {
+                                            format!("line {}, column {}", t.line, t.column)
+                                        });
+                                    return Err(format!(
+                                        "Syntax Error: Trailing comma in function arguments not allowed before ')' at {}",
+                                        trailing_comma_loc
+                                    ));
+                                }
+                            } else {
+                                break; // 不是 ',', 参数结束
+                            }
+                        }
                     }
-                } else if self.check(TokenType::RParen) {
-                    // Found ')', end of arguments
-                    break;
+                    self.expect(TokenType::RParen)?; // 消耗 ')'
+
+                    // 返回 FunctionCall 表达式。使用捕获的词素作为函数名。
+                    // 为了与 Evaluator 中的匹配逻辑一致，这里将函数名转换为大写。
+                    Ok(Expr::FunctionCall {
+                        name: name_lexeme.to_uppercase(),
+                        args,
+                    })
                 } else {
-                    let current_type_str = format!("{:?}", self.current_type());
-                    let location = self
-                        .current_token
-                        .as_ref()
-                        .map_or("end of input".to_string(), |t| {
-                            format!("line {}, column {}", t.line, t.column)
-                        });
-                    return Err(format!(
-                        "Syntax Error: Expected ',' or ')' after function argument, but found {} at {}",
-                        current_type_str, location
-                    ));
+                    // 后面没有跟着 '('. 将其视为一个简单的变量引用。
+                    // 这会处理裸露的标识符 (如 'C', 'H', 'MYVAR')。
+                    // 也包括了在表达式中没有作为前缀或函数调用的关键字 (如 IF, AND 等)
+                    // 如果裸露的关键字在表达式中不合法，可以在这里添加更具体的错误检查。
+                    // 暂时为了简化，先允许它们作为变量。
+                    self.advance(); // 消耗标识符或关键字 token
+                    Ok(Expr::Variable(name_lexeme))
                 }
             }
+
+            // --- 不能开始表达式的关键字 (如 THEN, ELSE) ---
+            TokenType::Then | TokenType::Else => Err(format!(
+                "Syntax Error: Unexpected keyword {:?} ('{}') found when expecting start of an expression at {}",
+                token.token_type, token.lexeme, location
+            )),
+
+            // --- 任何其他意外的 token ---
+            _ => Err(format!(
+                "Syntax Error: Unexpected token {:?} ('{}') found when expecting start of an expression at {}",
+                token.token_type, token.lexeme, location
+            )),
         }
-
-        self.expect(TokenType::RParen)?; // Consume ')'
-
-        Ok(Expr::FunctionCall {
-            name: func_name,
-            args,
-        })
     }
 
     // --- Operator Mapping Helpers ---
@@ -901,7 +905,7 @@ mod tests {
         // 更新期望错误子串
         check_parsing_error(
             input,
-            "Syntax Error: Unexpected ')' after comma in function call arguments",
+            "Trailing comma in function arguments not allowed before ')'",
         );
 
         // 子测试 2: MA(C, 5 (缺少右括号)
@@ -909,7 +913,7 @@ mod tests {
         // 更新期望错误子串
         check_parsing_error(
             input2,
-            "Syntax Error: Expected ',' or ')' after function argument, but found None",
+            "Expected token RParen, but found None at end of input",
         );
     }
 }
