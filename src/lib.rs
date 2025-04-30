@@ -1,6 +1,6 @@
-mod ast;
-mod data;
-mod evaluator;
-mod lexer;
-mod parser;
-mod token;
+pub mod ast;
+pub mod data;
+pub mod evaluator;
+pub mod lexer;
+pub mod parser;
+pub mod token;
